@@ -118,6 +118,9 @@ func (*Store) SearchCapabilities(context.Context) (tracestore.SearchCapabilities
 		// FindSpans below evaluates the same filter engine as FindTraces, over
 		// every span in the store rather than per matched trace (RFC 0016).
 		SpanSearch: true,
+		// FindTraceIDs and FindSpans sort their results and page through them with a
+		// keyset cursor (pagination.go).
+		Paginated: true,
 	}, nil
 }
 
@@ -129,13 +132,23 @@ func (*Store) SearchCapabilities(context.Context) (tracestore.SearchCapabilities
 // a matching span always keeps its own resource and scope, not its trace's
 // other spans' resources.
 //
-// The in-memory store has no pagination, so this yields everything in a
-// single chunk; RFC 0014 pagination for FindSpans is future work, tracked
-// alongside SpanQueryParams' own TODO for it.
+// The result is one page, sorted by spanKey and bounded by
+// query.Pagination.PageSize when that is positive. The chunk carries the next
+// page's token if more spans match (RFC 0014).
 func (st *Store) FindSpans(ctx context.Context, query tracestore.SpanQueryParams) iter.Seq2[tracestore.PageChunk[ptrace.Traces], error] {
 	m := st.getTenant(tenancy.GetTenant(ctx))
 	return func(yield func(tracestore.PageChunk[ptrace.Traces], error) bool) {
-		matched, err := m.findSpans(query)
+		fingerprint, err := query.Fingerprint()
+		if err != nil {
+			yield(tracestore.PageChunk[ptrace.Traces]{}, err)
+			return
+		}
+		after, err := cursorOf(query.Pagination.PageToken, fingerprint, decodeSpanKey)
+		if err != nil {
+			yield(tracestore.PageChunk[ptrace.Traces]{}, err)
+			return
+		}
+		matched, last, err := m.findSpans(query, after)
 		if err != nil {
 			yield(tracestore.PageChunk[ptrace.Traces]{}, err)
 			return
@@ -145,7 +158,14 @@ func (st *Store) FindSpans(ctx context.Context, query tracestore.SpanQueryParams
 			yield(tracestore.PageChunk[ptrace.Traces]{}, err)
 			return
 		}
-		yield(tracestore.PageChunk[ptrace.Traces]{Results: cloned}, nil)
+		chunk := tracestore.PageChunk[ptrace.Traces]{Results: cloned}
+		if last != nil {
+			if chunk.NextPageToken, err = tracestore.NewPageToken(fingerprint, last.encode()); err != nil {
+				yield(tracestore.PageChunk[ptrace.Traces]{}, err)
+				return
+			}
+		}
+		yield(chunk, nil)
 	}
 }
 
@@ -170,20 +190,53 @@ func (st *Store) FindTraces(ctx context.Context, query tracestore.TraceQueryPara
 	}
 }
 
+// FindTraceIDs without Pagination returns the most recently written matching
+// traces up to SearchDepth, as FindTraces does. With Pagination it sorts the
+// matching traces by traceKey, returns the page that follows the query's
+// token, at most PageSize traces, and carries the next page's token if more
+// traces match.
 func (st *Store) FindTraceIDs(ctx context.Context, query tracestore.TraceQueryParams) iter.Seq2[tracestore.PageChunk[[]tracestore.FoundTraceID], error] {
 	m := st.getTenant(tenancy.GetTenant(ctx))
 	return func(yield func(tracestore.PageChunk[[]tracestore.FoundTraceID], error) bool) {
-		traceAndIds, err := m.findTraceAndIds(query)
-		if err != nil {
+		var chunk tracestore.PageChunk[[]tracestore.FoundTraceID]
+		fail := func(err error) {
 			yield(tracestore.PageChunk[[]tracestore.FoundTraceID]{}, err)
-			return
 		}
-		ids := make([]tracestore.FoundTraceID, len(traceAndIds))
+		var traceAndIds []traceAndId
+		if query.Pagination == nil {
+			var err error
+			if traceAndIds, err = m.findTraceAndIds(query); err != nil {
+				fail(err)
+				return
+			}
+		} else {
+			fingerprint, err := query.Fingerprint()
+			if err != nil {
+				fail(err)
+				return
+			}
+			after, err := cursorOf(query.Pagination.PageToken, fingerprint, decodeTraceKey)
+			if err != nil {
+				fail(err)
+				return
+			}
+			var last *traceKey
+			if traceAndIds, last, err = m.findTraceAndIdsPage(query, after); err != nil {
+				fail(err)
+				return
+			}
+			if last != nil {
+				if chunk.NextPageToken, err = tracestore.NewPageToken(fingerprint, last.encode()); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}
+		chunk.Results = make([]tracestore.FoundTraceID, len(traceAndIds))
 		for i := range traceAndIds {
-			ids[i] = tracestore.FoundTraceID{TraceID: traceAndIds[i].id}
+			chunk.Results[i] = tracestore.FoundTraceID{TraceID: traceAndIds[i].id}
 		}
-		// TODO: Populate NextPageToken when the memory store supports RFC 0014 pagination.
-		yield(tracestore.PageChunk[[]tracestore.FoundTraceID]{Results: ids}, nil)
+		yield(chunk, nil)
 	}
 }
 

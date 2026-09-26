@@ -5,6 +5,8 @@ package memory
 
 import (
 	"errors"
+	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +40,20 @@ type traceAndId struct {
 	trace     ptrace.Traces
 	startTime time.Time
 	endTime   time.Time
+}
+
+// matchedSpan is a matching span with its resource and scope.
+type matchedSpan struct {
+	key          spanKey
+	resourceSpan ptrace.ResourceSpans
+	scopeSpan    ptrace.ScopeSpans
+	span         ptrace.Span
+}
+
+// matchedTrace is a matching trace with its sort key.
+type matchedTrace struct {
+	key   traceKey
+	entry traceAndId
 }
 
 func (t traceAndId) traceIsBetweenStartAndEnd(startTime time.Time, endTime time.Time) bool {
@@ -147,13 +163,14 @@ func (t *Tenant) findTraceAndIds(query tracestore.TraceQueryParams) ([]traceAndI
 	return traceAndIds, nil
 }
 
-// findSpans returns a fresh ptrace.Traces holding every span across every
-// trace the store holds whose start time falls within
-// [query.StartTimeMin, query.StartTimeMax] (either bound may be zero,
-// meaning unbounded) and which query.Filter matches. Each match gets its own
-// ResourceSpans/ScopeSpans pair, copied from where the span actually lives,
-// since a caller can hold spans from many different traces and resources in
-// one result (RFC 0016).
+// findSpans returns one page of the spans, across all traces, that start
+// within [query.StartTimeMin, query.StartTimeMax] (a zero bound is unbounded)
+// and match query.Filter. Matches are sorted by spanKey; the page starts after
+// the key `after` (at the beginning when nil) and holds at most
+// query.Pagination.PageSize spans when that is positive. The returned key is
+// the last span's if more matches remain, and nil otherwise. Each span is
+// copied with its own resource and scope, since one result can hold spans from
+// many traces and resources (RFC 0016).
 //
 // query.Filter's shape is checked once, before any span is visited, rather
 // than per span: an unsupported operator or a wrong argument count is a
@@ -161,13 +178,13 @@ func (t *Tenant) findTraceAndIds(query tracestore.TraceQueryParams) ([]traceAndI
 //
 // The returned Traces shares backing storage with the tenant's own copy;
 // callers must clone before handing it to a reader, as with findTraceAndIds.
-func (t *Tenant) findSpans(query tracestore.SpanQueryParams) (ptrace.Traces, error) {
+func (t *Tenant) findSpans(query tracestore.SpanQueryParams, after *spanKey) (ptrace.Traces, *spanKey, error) {
 	if err := validateFilterShape(query.Filter); err != nil {
-		return ptrace.Traces{}, err
+		return ptrace.Traces{}, nil, err
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	result := ptrace.NewTraces()
+	var matches []matchedSpan
 	for i := range t.traces {
 		entry := t.traces[i]
 		if entry.id.IsEmpty() {
@@ -183,18 +200,56 @@ func (t *Tenant) findSpans(query tracestore.SpanQueryParams) (ptrace.Traces, err
 						resourceSpan.SchemaUrl(), scopeSpan.SchemaUrl()) {
 						continue
 					}
-					rs := result.ResourceSpans().AppendEmpty()
-					resourceSpan.Resource().CopyTo(rs.Resource())
-					rs.SetSchemaUrl(resourceSpan.SchemaUrl())
-					ss := rs.ScopeSpans().AppendEmpty()
-					scopeSpan.Scope().CopyTo(ss.Scope())
-					ss.SetSchemaUrl(scopeSpan.SchemaUrl())
-					span.CopyTo(ss.Spans().AppendEmpty())
+					matches = append(matches, matchedSpan{key: spanKeyOf(span), resourceSpan: resourceSpan, scopeSpan: scopeSpan, span: span})
 				}
 			}
 		}
 	}
-	return result, nil
+	slices.SortFunc(matches, func(a, b matchedSpan) int { return compareSpanKeys(a.key, b.key) })
+	matches, last := page(matches, func(m matchedSpan) spanKey { return m.key }, compareSpanKeys, after, query.Pagination.PageSize)
+	result := ptrace.NewTraces()
+	for _, m := range matches {
+		rs := result.ResourceSpans().AppendEmpty()
+		m.resourceSpan.Resource().CopyTo(rs.Resource())
+		rs.SetSchemaUrl(m.resourceSpan.SchemaUrl())
+		ss := rs.ScopeSpans().AppendEmpty()
+		m.scopeSpan.Scope().CopyTo(ss.Scope())
+		ss.SetSchemaUrl(m.scopeSpan.SchemaUrl())
+		m.span.CopyTo(ss.Spans().AppendEmpty())
+	}
+	return result, last, nil
+}
+
+// findTraceAndIdsPage is findTraceAndIds for a query with Pagination: the
+// matching traces sorted by traceKey, starting after the key `after` (at the
+// beginning when nil), at most PageSize of them. The returned key is the last
+// trace's if more matches remain, and nil otherwise. Like findTraceAndIds it
+// returns references, not copies.
+func (t *Tenant) findTraceAndIdsPage(query tracestore.TraceQueryParams, after *traceKey) ([]traceAndId, *traceKey, error) {
+	if query.Pagination.PageSize <= 0 {
+		return nil, nil, fmt.Errorf("%w: page size must be greater than 0", tracestore.ErrPaginationInvalid)
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var matches []matchedTrace
+	for i := range t.traces {
+		entry := t.traces[i]
+		if entry.id.IsEmpty() {
+			continue
+		}
+		startTime, ok := latestMatchingSpanStart(entry.trace, query)
+		if !ok {
+			continue
+		}
+		matches = append(matches, matchedTrace{key: traceKey{startTime: startTime, traceID: entry.id}, entry: entry})
+	}
+	slices.SortFunc(matches, func(a, b matchedTrace) int { return compareTraceKeys(a.key, b.key) })
+	matches, last := page(matches, func(m matchedTrace) traceKey { return m.key }, compareTraceKeys, after, query.Pagination.PageSize)
+	traceAndIds := make([]traceAndId, len(matches))
+	for i, m := range matches {
+		traceAndIds[i] = m.entry
+	}
+	return traceAndIds, last, nil
 }
 
 func spanStartsWithin(span ptrace.Span, startTimeMin, startTimeMax time.Time) bool {
@@ -283,7 +338,32 @@ func findServiceNameWithSpanId(trace ptrace.Traces, spanId pcommon.SpanID) (stri
 	return "", false
 }
 
+// validTrace reports whether any span of the trace matches the query.
 func validTrace(td ptrace.Traces, query tracestore.TraceQueryParams) bool {
+	matched := false
+	forEachMatchingSpan(td, query, func(ptrace.Span) bool {
+		matched = true
+		return false
+	})
+	return matched
+}
+
+// latestMatchingSpanStart returns the latest start time among the trace's
+// matching spans, and false if none matches.
+func latestMatchingSpanStart(td ptrace.Traces, query tracestore.TraceQueryParams) (pcommon.Timestamp, bool) {
+	var latest pcommon.Timestamp
+	matched := false
+	forEachMatchingSpan(td, query, func(span ptrace.Span) bool {
+		matched = true
+		latest = max(latest, span.StartTimestamp())
+		return true
+	})
+	return latest, matched
+}
+
+// forEachMatchingSpan calls visit on each span of the trace that matches the
+// query, stopping when visit returns false.
+func forEachMatchingSpan(td ptrace.Traces, query tracestore.TraceQueryParams, visit func(ptrace.Span) bool) {
 	for _, resourceSpan := range td.ResourceSpans().All() {
 		// query.ServiceName is always empty when query.Filter is set (the two are
 		// mutually exclusive, enforced before a Reader ever sees the query), so this
@@ -295,13 +375,12 @@ func validTrace(td ptrace.Traces, query tracestore.TraceQueryParams) bool {
 		for _, scopeSpan := range resourceSpan.ScopeSpans().All() {
 			for _, span := range scopeSpan.Spans().All() {
 				if validSpan(resourceSpan.Resource(), scopeSpan.Scope(), span, query,
-					resourceSpan.SchemaUrl(), scopeSpan.SchemaUrl()) {
-					return true
+					resourceSpan.SchemaUrl(), scopeSpan.SchemaUrl()) && !visit(span) {
+					return
 				}
 			}
 		}
 	}
-	return false
 }
 
 func validResource(resource pcommon.Resource, query tracestore.TraceQueryParams) bool {
