@@ -457,7 +457,22 @@ func TestQueryToReaderShape(t *testing.T) {
 		query := tracestore.TraceQueryParams{Filter: serviceIs("cart")}
 		prepared, err := queryToReaderCapabilities(query, filterCapable)
 		require.NoError(t, err)
-		assert.Equal(t, query, prepared)
+		assert.Equal(t, query.Filter, prepared.Filter, "the filter reaches the reader unconverted")
+		// filterCapable does not declare WithoutServiceName, the same as the two backends that
+		// both require a service name and evaluate filters natively (RFC 0005 M5): the check
+		// right after this call reads ServiceName, not the filter, so a query naming the
+		// service only inside the filter needs it copied out here too (RFC 0005 §7).
+		assert.Equal(t, "cart", prepared.ServiceName,
+			"a service named only in the filter must still satisfy a reader that requires one")
+	})
+
+	t.Run("a reader without that requirement gets no such copy", func(t *testing.T) {
+		query := tracestore.TraceQueryParams{Filter: serviceIs("cart")}
+		caps := filterCapable
+		caps.WithoutServiceName = true
+		prepared, err := queryToReaderCapabilities(query, caps)
+		require.NoError(t, err)
+		assert.Empty(t, prepared.ServiceName, "nothing downstream of this call needs it copied out")
 	})
 
 	t.Run("a reader that evaluates none is given the legacy fields", func(t *testing.T) {
@@ -499,5 +514,44 @@ func TestQueryToReaderShape(t *testing.T) {
 		query := tracestore.TraceQueryParams{Filter: serviceIs("cart"), Pagination: &tracestore.Pagination{PageSize: 50, PageToken: "cursor"}}
 		_, err := queryToReaderCapabilities(query, filterCapable)
 		require.ErrorIs(t, err, tracestore.ErrPaginationUnsupported)
+	})
+}
+
+// TestServiceNameFromFilter covers the walk queryToReaderCapabilities uses to copy a service
+// name out of a filter a service-requiring reader is about to receive unconverted.
+func TestServiceNameFromFilter(t *testing.T) {
+	t.Run("a bare equality", func(t *testing.T) {
+		assert.Equal(t, "cart", serviceNameFromFilter(serviceIs("cart")))
+	})
+
+	t.Run("nested under an and, the only shape these readers' filters take (RFC 0005 M5)", func(t *testing.T) {
+		filter := &expression.Call{Op: expression.OpAnd, Args: []expression.Expression{
+			serviceIs("cart"),
+			&expression.Call{Op: expression.OpEq, Args: []expression.Expression{
+				&expression.AttributeRef{Key: "http.status_code"},
+				&expression.AnyValue{Value: "500"},
+			}},
+		}}
+		assert.Equal(t, "cart", serviceNameFromFilter(filter))
+	})
+
+	t.Run("a service field compared to something other than a string", func(t *testing.T) {
+		filter := &expression.Call{Op: expression.OpEq, Args: []expression.Expression{
+			&expression.FieldRef{Level: expression.LevelResource, Name: expression.ResourceFieldService},
+			&expression.AnyValue{Value: "cart"},
+		}}
+		assert.Empty(t, serviceNameFromFilter(filter))
+	})
+
+	t.Run("no service predicate", func(t *testing.T) {
+		filter := &expression.Call{Op: expression.OpEq, Args: []expression.Expression{
+			&expression.AttributeRef{Key: "http.status_code"},
+			&expression.AnyValue{Value: "500"},
+		}}
+		assert.Empty(t, serviceNameFromFilter(filter))
+	})
+
+	t.Run("nil filter", func(t *testing.T) {
+		assert.Empty(t, serviceNameFromFilter(nil))
 	})
 }

@@ -6,6 +6,7 @@ package querysvc
 import (
 	"go.opentelemetry.io/collector/featuregate"
 
+	expression "github.com/jaegertracing/jaeger-idl/query/expression/v1"
 	"github.com/jaegertracing/jaeger/internal/storage/v2/api/tracestore"
 )
 
@@ -57,5 +58,51 @@ func queryToReaderCapabilities(
 	if caps.Filter.IsEmpty() {
 		return query.ToLegacyShape()
 	}
-	return query, caps.Filter.EnsureSupported(query.Filter)
+	if err := caps.Filter.EnsureSupported(query.Filter); err != nil {
+		return query, err
+	}
+	// A reader that requires a service name (caps.WithoutServiceName false) is checked for one
+	// right after this by the field this function does not touch for a declared filter: unlike
+	// the legacy rewrite above, the filter reaches the reader as it is, predicates and all, so a
+	// query naming the service only inside it reads as if it named none at all unless that name
+	// is copied out here too.
+	if query.ServiceName == "" && !caps.WithoutServiceName {
+		query.ServiceName = serviceNameFromFilter(query.Filter)
+	}
+	return query, nil
+}
+
+// serviceNameFromFilter looks for an equality on the resource service field within a filter
+// that is about to reach a reader unconverted (RFC 0005 §7). Every operator reaching here has
+// already passed caps.Filter.EnsureSupported, so a reader that requires a service name but
+// declares no operator wider than a flat `and`/`eq` conjunction (RFC 0005 M5) is one this walk
+// can answer completely: the service name is the one leaf no wider operator could have hidden
+// behind. A reader whose declared capability allows `or`, which could name the service on one
+// branch only, is not told to require a service name in the first place (RFC 0005 M4).
+func serviceNameFromFilter(filter *expression.Call) string {
+	if filter == nil {
+		return ""
+	}
+	if filter.Op == expression.OpAnd {
+		for _, arg := range filter.Args {
+			if call, ok := arg.(*expression.Call); ok {
+				if name := serviceNameFromFilter(call); name != "" {
+					return name
+				}
+			}
+		}
+		return ""
+	}
+	if filter.Op != expression.OpEq || len(filter.Args) != 2 {
+		return ""
+	}
+	field, ok := filter.Args[0].(*expression.FieldRef)
+	if !ok || field.Level != expression.LevelResource || field.Name != expression.ResourceFieldService {
+		return ""
+	}
+	value, ok := filter.Args[1].(*expression.StringValue)
+	if !ok {
+		return ""
+	}
+	return value.Value
 }
