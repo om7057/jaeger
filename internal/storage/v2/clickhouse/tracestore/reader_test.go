@@ -1389,6 +1389,42 @@ func TestFindTraces_StagedQueries(t *testing.T) {
 	require.True(t, spans.Closed)
 }
 
+// TestFindTraces_MixedCandidateMetadata pins the span-fetch statement's actual shape over several
+// candidates with different timestamp metadata: one disjunct per trace, one of them unbounded
+// because its trace has no trace_id_timestamps row (#9882). TestFindTraces_Success only ever
+// drives a single candidate (addTraceSearchResponses), so its snapshot never showed this shape;
+// buildFindTracesQuery's own "mixed metadata" case in query_builder_test.go asserts the same
+// string directly, this pins it as the snapshot a reader of TestFindTraces_* actually sees.
+func TestFindTraces_MixedCandidateMetadata(t *testing.T) {
+	candidates := &clickhousetest.Rows[[]any]{
+		Data:   [][]any{{traceIDHex1}, {traceIDHex2}, {traceIDHex3}},
+		ScanFn: scanTraceIDFn(),
+	}
+	timestamps := &clickhousetest.Rows[[]any]{
+		// traceIDHex2 has no row, so it stays unbounded in the span fetch below.
+		Data: [][]any{
+			{traceIDHex1, now.Add(-2 * time.Hour), now.Add(-time.Hour)},
+			{traceIDHex3, now.Add(-time.Hour), now},
+		},
+		ScanFn: scanTraceIDFn(),
+	}
+	conn := &clickhousetest.Driver{QueryResponses: map[string]*clickhousetest.QueryResponse{
+		sql.SearchTraceIDsBase:      {Rows: candidates},
+		sql.SelectTraceIDTimestamps: {Rows: timestamps},
+		sql.SelectSpansQuery: {
+			Rows: &clickhousetest.Rows[*dbmodel.SpanRow]{Data: singleSpan, ScanFn: scanSpanRowFn()},
+		},
+	}}
+
+	reader := NewReader(conn, testReaderConfig)
+	traces, err := jiter.FlattenWithErrors(reader.FindTraces(t.Context(), tracestore.TraceQueryParams{Attributes: pcommon.NewMap()}))
+
+	require.NoError(t, err)
+	requireTracesEqual(t, singleSpan, traces)
+	require.Len(t, conn.RecordedQueries, 3)
+	verifyQuerySnapshot(t, conn.RecordedQueries...)
+}
+
 func TestFindTraces_NoCandidates(t *testing.T) {
 	for _, method := range []string{"FindTraces", "FindTraceIDs"} {
 		t.Run(method, func(t *testing.T) {
