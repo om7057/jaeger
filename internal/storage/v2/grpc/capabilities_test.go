@@ -146,9 +146,35 @@ func TestQueryParametersCarryPagination(t *testing.T) {
 	assert.Equal(t, &tracestore.Pagination{PageSize: 25, PageToken: "opaque-cursor"}, decoded.Pagination)
 	assert.Zero(t, decoded.SearchDepth, "Pagination replaces search_depth rather than setting it")
 
-	decoded, err = NewHandler(new(tracestoremocks.Reader), nil, nil).toTraceQueryParams(&storage.TraceQueryParameters{
+	// A present Pagination with no PageSize is refused rather than passed through: nothing
+	// downstream of this boundary fills in a default for a trace search the way it does for a
+	// span search, and letting a zero page size through would be the unbounded query #9760 is
+	// about.
+	_, err = NewHandler(new(tracestoremocks.Reader), nil, nil).toTraceQueryParams(&storage.TraceQueryParameters{
 		Pagination: &storage.Pagination{},
 	})
+	require.ErrorContains(t, err, "PageSize is required whenever Pagination is present")
+}
+
+// TestQueryParametersPaginationCannotCombineWithSearchDepth pins the other half of #9760: a
+// trace query setting both SearchDepth and Pagination is refused, the same way the query
+// service refuses it (RFC 0014 §4), rather than letting SearchDepth silently coexist with a
+// page size the reader would not know how to reconcile.
+func TestQueryParametersPaginationCannotCombineWithSearchDepth(t *testing.T) {
+	_, err := NewHandler(new(tracestoremocks.Reader), nil, nil).toTraceQueryParams(&storage.TraceQueryParameters{
+		SearchDepth: 10,
+		Pagination:  &storage.Pagination{PageSize: 25},
+	})
+	require.ErrorContains(t, err, "Pagination cannot be combined with SearchDepth")
+}
+
+// TestQueryParametersPaginationClampsOversizedPageSize pins that a page size above the query
+// service's own cap is clamped rather than refused, matching the AIP-158 treatment RFC 0014 §4
+// specifies.
+func TestQueryParametersPaginationClampsOversizedPageSize(t *testing.T) {
+	decoded, err := NewHandler(new(tracestoremocks.Reader), nil, nil).toTraceQueryParams(&storage.TraceQueryParameters{
+		Pagination: &storage.Pagination{PageSize: tracestore.MaxPageSize + 1},
+	})
 	require.NoError(t, err)
-	assert.Equal(t, &tracestore.Pagination{}, decoded.Pagination, "a present but empty message keeps its presence")
+	assert.Equal(t, tracestore.MaxPageSize, decoded.Pagination.PageSize)
 }

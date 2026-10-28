@@ -163,6 +163,10 @@ func (h *Handler) FindSpans(req *storage.FindSpansRequest, srv storage.TraceRead
 	return nil
 }
 
+// toSpanQueryParams translates a wire query into the reader's shape. A span search has no
+// SearchDepth, so the page size is its only bound (RFC 0016 §6) and is never left at zero: a
+// remote client reaches the reader directly, without the query service's own default-filling
+// and clamping (#9760), so this boundary applies the same bound the query service would.
 func toSpanQueryParams(wire *storage.SpanQueryParameters) (tracestore.SpanQueryParams, error) {
 	if wire == nil {
 		return tracestore.SpanQueryParams{}, status.Error(codes.InvalidArgument, "missing query")
@@ -175,13 +179,17 @@ func toSpanQueryParams(wire *storage.SpanQueryParameters) (tracestore.SpanQueryP
 	if err != nil {
 		return tracestore.SpanQueryParams{}, status.Error(codes.InvalidArgument, err.Error())
 	}
+	pageSize := wire.GetPagination().GetPageSize()
+	if pageSize == 0 {
+		pageSize = tracestore.DefaultPageSize
+	}
 	return tracestore.SpanQueryParams{
 		StartTimeMin: wire.StartTimeMin,
 		StartTimeMax: wire.StartTimeMax,
 		Filter:       filter,
 		OrderBy:      order,
 		Pagination: tracestore.Pagination{
-			PageSize:  wire.GetPagination().GetPageSize(),
+			PageSize:  min(pageSize, tracestore.MaxPageSize),
 			PageToken: tracestore.PageToken(wire.GetPagination().GetPageToken()),
 		},
 	}, nil
@@ -346,8 +354,12 @@ func (h *Handler) GetCapabilities(
 // toTraceQueryParams translates a wire query into the reader's shape. It also finalizes the
 // filter, because the decoder only builds the tree and does not validate it, and it refuses a
 // query that carries both a filter and the legacy predicate fields (RFC 0005 §7). Both refusals
-// are InvalidArgument. It does not validate Pagination or consult the reader's capabilities:
-// converting a query toward what the reader supports is the query service's job (ADR-013).
+// are InvalidArgument. Pagination gets the same bound the query service applies before a
+// request reaches a Reader (#9760): a page size is required whenever Pagination is present, it
+// cannot be combined with SearchDepth, and an oversized one is clamped rather than refused
+// (RFC 0014 §4). It does not consult the reader's capabilities or the pagination feature gate:
+// converting a query toward what the reader supports, and whether pagination is enabled at all,
+// stay the query service's job (ADR-013).
 func (*Handler) toTraceQueryParams(t *storage.TraceQueryParameters) (tracestore.TraceQueryParams, error) {
 	filter, err := expressionproto.CallFromProto(t.GetFilter())
 	if err == nil && filter != nil {
@@ -373,8 +385,16 @@ func (*Handler) toTraceQueryParams(t *storage.TraceQueryParameters) (tracestore.
 		Filter:        filter,
 	}
 	if pagination := t.GetPagination(); pagination != nil {
+		if searchDepth != 0 {
+			return tracestore.TraceQueryParams{}, status.Error(codes.InvalidArgument,
+				"Pagination cannot be combined with SearchDepth")
+		}
+		if pagination.GetPageSize() == 0 {
+			return tracestore.TraceQueryParams{}, status.Error(codes.InvalidArgument,
+				"PageSize is required whenever Pagination is present")
+		}
 		query.Pagination = &tracestore.Pagination{
-			PageSize:  pagination.GetPageSize(),
+			PageSize:  min(pagination.GetPageSize(), tracestore.MaxPageSize),
 			PageToken: tracestore.PageToken(pagination.GetPageToken()),
 		}
 	}

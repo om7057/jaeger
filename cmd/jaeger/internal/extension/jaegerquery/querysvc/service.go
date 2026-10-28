@@ -27,10 +27,11 @@ import (
 // here rather than in each API handler, so a gRPC and an HTTP client get the same bound.
 const DefaultSearchDepth uint32 = 100
 
-// DefaultPageSize bounds a span search whose caller left the page size unset. A span query has
-// no SearchDepth, so the page size is its only bound (RFC 0016 §6), and a Reader never receives
-// a query without one. It is applied here for the same reason as DefaultSearchDepth.
-const DefaultPageSize uint32 = DefaultSearchDepth
+// DefaultPageSize bounds a span search whose caller left the page size unset. It is
+// tracestore.DefaultPageSize under this package's own name, since the gRPC remote storage
+// server (internal/storage/v2/grpc) fills in the same bound for the clients that reach a
+// Reader without going through the query service, and the two must agree (#9760).
+const DefaultPageSize uint32 = tracestore.DefaultPageSize
 
 // QueryServiceOptions holds the configuration options for the query service.
 type QueryServiceOptions struct {

@@ -1179,7 +1179,7 @@ func TestFindTracesRemoteErrors(t *testing.T) {
 
 func TestSpanQueryConversion(t *testing.T) {
 	filter := p.Span().Name.Eq(p.String("operation"))
-	query := tracestore.SpanQueryParams{Filter: filter, OrderBy: spanOrder()}
+	query := tracestore.SpanQueryParams{Filter: filter, OrderBy: spanOrder(), Pagination: tracestore.Pagination{PageSize: 50}}
 	wire, err := toProtoSpanQuery(query)
 	require.NoError(t, err)
 	got, err := toSpanQueryParams(wire)
@@ -1242,16 +1242,32 @@ func TestSpanClientCannotStartStream(t *testing.T) {
 	assert.ErrorContains(t, err, "failed to execute FindSpans")
 }
 
-func TestSpanQueryConversionDoesNotValidate(t *testing.T) {
+func TestSpanQueryConversionDoesNotValidateFilterOrOrder(t *testing.T) {
 	query := tracestore.SpanQueryParams{
-		Filter:  &expression.Call{Op: "custom", Args: []expression.Expression{}},
-		OrderBy: []tracestore.SpanSortOrder{{Expression: &expression.AttributeRef{Level: expression.LevelSpan, Key: "priority"}, Direction: "custom"}},
+		Filter:     &expression.Call{Op: "custom", Args: []expression.Expression{}},
+		OrderBy:    []tracestore.SpanSortOrder{{Expression: &expression.AttributeRef{Level: expression.LevelSpan, Key: "priority"}, Direction: "custom"}},
+		Pagination: tracestore.Pagination{PageSize: 50},
 	}
 	wire, err := toProtoSpanQuery(query)
 	require.NoError(t, err)
 	got, err := toSpanQueryParams(wire)
 	require.NoError(t, err)
 	assert.Equal(t, query, got)
+}
+
+// TestSpanQueryConversionFillsPageSize pins the fix for #9760: a span query reaching this
+// boundary with no page size, the only bound FindSpans has, gets the same default the query
+// service applies, rather than reaching the reader unbounded.
+func TestSpanQueryConversionFillsPageSize(t *testing.T) {
+	got, err := toSpanQueryParams(&storage.SpanQueryParameters{})
+	require.NoError(t, err)
+	assert.Equal(t, tracestore.DefaultPageSize, got.Pagination.PageSize)
+
+	got, err = toSpanQueryParams(&storage.SpanQueryParameters{
+		Pagination: &storage.Pagination{PageSize: tracestore.MaxPageSize + 1},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, tracestore.MaxPageSize, got.Pagination.PageSize, "an oversized page size is clamped rather than refused")
 }
 
 type spanProxyServer struct {

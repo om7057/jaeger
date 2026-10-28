@@ -201,6 +201,12 @@ type TraceQueryParams struct {
 // page-size field (RFC 0014 §4).
 const MaxPageSize uint32 = 10000
 
+// DefaultPageSize bounds a span search whose caller left the page size unset. A span query has
+// no SearchDepth (RFC 0016 §6), so PageSize is the only bound and is never left at zero: every
+// caller of a Reader, whether through the query service or directly over the gRPC remote storage
+// API, fills this in before PageSize reaches a Reader.
+const DefaultPageSize uint32 = 100
+
 // Pagination asks for one page of a search result and, on continuation, says where the
 // previous page stopped. It mirrors jaeger.api_v3.Pagination and jaeger.storage.v2.Pagination
 // (RFC 0014 §4, §6).
